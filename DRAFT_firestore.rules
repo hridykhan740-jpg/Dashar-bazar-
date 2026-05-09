@@ -1,0 +1,75 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 0.1 Global Helpers
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+    function isAdmin() { return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN'; }
+    function isVendor() { return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'VENDOR' || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN'); }
+    
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    // --- Users ---
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.keys().hasAll(['name', 'email', 'role', 'createdAt', 'updatedAt']) &&
+               data.keys().size() <= 7 &&
+               data.role in ['USER', 'VENDOR', 'ADMIN'] &&
+               data.name is string && data.name.size() <= 100 &&
+               data.email is string && data.email.size() <= 100 &&
+               data.createdAt == request.time &&
+               data.updatedAt == request.time;
+      }
+
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId) && isValidUser(incoming()) && incoming().role == 'USER'; // Default to USER on sign up
+      allow update: if (isOwner(userId) || isAdmin()) && (
+        (incoming().diff(existing()).affectedKeys().hasOnly(['name', 'avatar', 'updatedAt']) && incoming().updatedAt == request.time) ||
+        isAdmin()
+      );
+    }
+
+    // --- Products ---
+    match /products/{productId} {
+      function isValidProduct(data) {
+        return data.keys().hasAll(['title', 'price', 'category', 'thumbnail', 'vendorId', 'vendorName', 'createdAt', 'updatedAt']) &&
+               data.title is string && data.title.size() <= 200 &&
+               data.price is number && data.price >= 0 &&
+               data.vendorId == (isAdmin() ? data.vendorId : request.auth.uid) &&
+               data.createdAt is timestamp;
+      }
+
+      allow read: if true; // Public products
+      allow create: if isVendor() && isValidProduct(incoming()) && incoming().createdAt == request.time;
+      allow update: if (isVendor() && existing().vendorId == request.auth.uid) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'price', 'discountPrice', 'stock', 'thumbnail', 'images', 'updatedAt']) &&
+        incoming().updatedAt == request.time
+      ) || isAdmin();
+      allow delete: if isAdmin() || (isVendor() && existing().vendorId == request.auth.uid);
+    }
+
+    // --- Orders ---
+    match /orders/{orderId} {
+      function isValidOrder(data) {
+        return data.keys().hasAll(['userId', 'items', 'status', 'totalAmount', 'createdAt', 'updatedAt']) &&
+               data.userId == request.auth.uid &&
+               data.items is list && data.items.size() > 0 &&
+               data.totalAmount is number &&
+               data.status in ['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED'];
+      }
+
+      allow list: if isVerified() && resource.data.userId == request.auth.uid;
+      allow get: if isVerified() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isVerified() && isValidOrder(incoming()) && incoming().createdAt == request.time;
+      allow update: if isAdmin() || (isOwner(existing().userId) && incoming().diff(existing()).affectedKeys().hasOnly(['status']) && existing().status == 'PENDING' && incoming().status == 'CANCELLED');
+    }
+  }
+}
